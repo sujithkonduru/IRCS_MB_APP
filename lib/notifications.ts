@@ -67,6 +67,156 @@ async function getNotificationsModule() {
   }
 }
 
+export type NotificationPermissionState = {
+  status: string;
+  canAskAgain: boolean;
+};
+
+export interface CampusPresenceAlert {
+  requestId: string | null;
+  notificationId: string;
+  title: string;
+  message: string;
+}
+
+const campusPresenceAlertListeners = new Set<
+  (alert: CampusPresenceAlert) => void
+>();
+const recentCampusPresenceAlertKeys = new Map<string, number>();
+const registeredPushTokenKeys = new Set<string>();
+const pushTokenRegistrationPromises = new Map<string, Promise<void>>();
+
+async function registerPushTokenForUser(
+  userId: string | number,
+  pushToken: string,
+): Promise<void> {
+  const registrationKey = `${String(userId)}:${pushToken}`;
+  if (registeredPushTokenKeys.has(registrationKey)) {
+    return;
+  }
+
+  const existingRegistration =
+    pushTokenRegistrationPromises.get(registrationKey);
+  if (existingRegistration) {
+    return existingRegistration;
+  }
+
+  const registration = (async () => {
+    const { registerPushToken } = await import('@/api/axios');
+    await registerPushToken({
+      userId,
+      pushToken,
+    });
+    registeredPushTokenKeys.add(registrationKey);
+    console.info('[Push Notifications] Backend confirmed token registration.');
+  })();
+
+  pushTokenRegistrationPromises.set(registrationKey, registration);
+  try {
+    await registration;
+  } finally {
+    pushTokenRegistrationPromises.delete(registrationKey);
+  }
+}
+
+export function subscribeToCampusPresenceAlerts(
+  listener: (alert: CampusPresenceAlert) => void,
+) {
+  campusPresenceAlertListeners.add(listener);
+  return () => {
+    campusPresenceAlertListeners.delete(listener);
+  };
+}
+
+export function publishCampusPresenceAlert(
+  alert: CampusPresenceAlert,
+): boolean {
+  const now = Date.now();
+  const notificationKey = `notification:${alert.notificationId}`;
+  const requestKey = alert.requestId
+    ? `request:${alert.requestId}`
+    : null;
+  const lastRequestAlert = requestKey
+    ? recentCampusPresenceAlertKeys.get(requestKey)
+    : undefined;
+
+  if (
+    recentCampusPresenceAlertKeys.has(notificationKey) ||
+    (lastRequestAlert !== undefined && now - lastRequestAlert < 5000)
+  ) {
+    return false;
+  }
+
+  recentCampusPresenceAlertKeys.set(notificationKey, now);
+  if (requestKey) {
+    recentCampusPresenceAlertKeys.set(requestKey, now);
+  }
+  for (const [key, timestamp] of recentCampusPresenceAlertKeys) {
+    if (now - timestamp > 60_000) {
+      recentCampusPresenceAlertKeys.delete(key);
+    }
+  }
+  if (recentCampusPresenceAlertKeys.size > 100) {
+    const oldestKey = recentCampusPresenceAlertKeys.keys().next().value;
+    if (oldestKey) {
+      recentCampusPresenceAlertKeys.delete(oldestKey);
+    }
+  }
+
+  campusPresenceAlertListeners.forEach((listener) => listener(alert));
+  return true;
+}
+
+export async function getNotificationPermissionStatusAsync(): Promise<NotificationPermissionState> {
+  try {
+    const Notifications = await getNotificationsModule();
+    if (!Notifications) {
+      return { status: 'unavailable', canAskAgain: false };
+    }
+
+    const permission = await Notifications.getPermissionsAsync();
+    return {
+      status: permission.status,
+      canAskAgain: permission.canAskAgain,
+    };
+  } catch (error) {
+    console.warn(
+      '[Push Notifications] Unable to read permission status:',
+      error
+    );
+    return { status: 'unavailable', canAskAgain: false };
+  }
+}
+
+export async function requestNotificationPermissionAsync(): Promise<NotificationPermissionState> {
+  try {
+    const Notifications = await getNotificationsModule();
+    if (!Notifications) {
+      return { status: 'unavailable', canAskAgain: false };
+    }
+
+    const current = await Notifications.getPermissionsAsync();
+    if (current.status === 'granted' || !current.canAskAgain) {
+      return {
+        status: current.status,
+        canAskAgain: current.canAskAgain,
+      };
+    }
+
+    const requested = await Notifications.requestPermissionsAsync();
+    return {
+      status: requested.status,
+      canAskAgain: requested.canAskAgain,
+    };
+  } catch (error) {
+    console.warn(
+      '[Push Notifications] Unable to request permission:',
+      error
+    );
+    return { status: 'unavailable', canAskAgain: false };
+  }
+}
+
 /**
  * Configure notification behavior.
  *
@@ -121,199 +271,142 @@ async function configureNotificationHandler() {
  *   pushToken = ExpoTokenB
  */
 export async function registerForPushNotificationsAsync(
-  userId?: string | number
+  userId?: string | number,
+  requestPermission = true,
 ) {
+  if (userId === undefined || userId === null || String(userId).trim() === '') {
+    throw new Error(
+      'The authenticated users.id is missing; the Expo Push Token cannot be registered.',
+    );
+  }
+
+  if (Platform.OS === 'android' && isExpoGo) {
+    console.info(
+      '[Push Notifications] Skipped because Android Expo Go does not support remote push notifications.',
+    );
+    return null;
+  }
+
+  if (!Device.isDevice) {
+    console.warn('[Push Notifications] A physical device is required.');
+    return null;
+  }
+
+  const Notifications = await getNotificationsModule();
+  if (!Notifications) {
+    return null;
+  }
+
+  await configureNotificationHandler();
+
+  let permission = await Notifications.getPermissionsAsync();
+  console.info('[Push Notifications] Permission status:', permission.status);
+  if (
+    permission.status !== 'granted' &&
+    permission.canAskAgain &&
+    requestPermission
+  ) {
+    permission = await Notifications.requestPermissionsAsync();
+    console.info(
+      '[Push Notifications] Permission status after request:',
+      permission.status,
+    );
+  }
+  if (permission.status !== 'granted') {
+    console.warn('[Push Notifications] Permission was not granted.');
+    return null;
+  }
+
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('default', {
+      name: 'Attendance',
+      importance: Notifications.AndroidImportance.MAX,
+      sound: 'default',
+      vibrationPattern: [0, 250, 250, 250],
+    });
+    await Notifications.setNotificationChannelAsync('campus-presence', {
+      name: 'Campus presence alerts',
+      importance: Notifications.AndroidImportance.MAX,
+      sound: 'default',
+      vibrationPattern: [0, 250, 250, 250],
+    });
+  }
+
+  const projectId =
+    Constants.expoConfig?.extra?.eas?.projectId ??
+    Constants.easConfig?.projectId;
+  if (!projectId) {
+    throw new Error('Expo EAS projectId is not configured.');
+  }
+
+  const tokenResponse = await Notifications.getExpoPushTokenAsync({
+    projectId,
+  });
+  const pushToken =
+    typeof tokenResponse.data === 'string'
+      ? tokenResponse.data.trim()
+      : '';
+  if (!pushToken || pushToken === 'null' || pushToken === 'undefined') {
+    throw new Error('Expo did not return a valid push token.');
+  }
+  if (!/^Expo(?:nent)?PushToken\[[^\]]+\]$/.test(pushToken)) {
+    throw new Error(
+      'The notification SDK returned a native or invalid token instead of an Expo Push Token.',
+    );
+  }
+  console.info('[Push Notifications] Expo Push Token generated.');
+
+  await registerPushTokenForUser(userId, pushToken);
+  return pushToken;
+}
+
+export async function setupPushTokenChangeListener(
+  onTokenChanged: () => void,
+): Promise<() => void> {
+  const Notifications = await getNotificationsModule();
+  if (!Notifications) {
+    return () => {};
+  }
+
+  const subscription = Notifications.addPushTokenListener(() => {
+    // This event carries the native APNs/FCM device token. Re-fetch the
+    // Expo Push Token rather than sending the native token to the backend.
+    console.info('[Push Notifications] Native device token changed.');
+    onTokenChanged();
+  });
+  return () => subscription.remove();
+}
+
+export async function getLastNotificationResponseAsync() {
+  const Notifications = await getNotificationsModule();
+  if (!Notifications) {
+    return null;
+  }
+
   try {
-    /**
-     * Android Expo Go:
-     *
-     * Don't even load expo-notifications.
-     */
-    if (Platform.OS === 'android' && isExpoGo) {
-      console.log(
-        '[Push Notifications] Skipped because app is running in Android Expo Go.'
-      );
-
-      return null;
-    }
-
-    /**
-     * Physical device required.
-     */
-    if (!Device.isDevice) {
-      console.warn(
-        '[Push Notifications] Physical device required.'
-      );
-
-      return null;
-    }
-
-    /**
-     * Dynamically load notifications.
-     */
-    const Notifications =
-      await getNotificationsModule();
-
-    if (!Notifications) {
-      return null;
-    }
-
-    /**
-     * Configure notification handler.
-     */
-    await configureNotificationHandler();
-
-    /**
-     * Check permission.
-     */
-    const { status: existingStatus } =
-      await Notifications.getPermissionsAsync();
-
-    let finalStatus = existingStatus;
-
-    /**
-     * Request permission if necessary.
-     */
-    if (existingStatus !== 'granted') {
-      const { status } =
-        await Notifications.requestPermissionsAsync();
-
-      finalStatus = status;
-    }
-
-    /**
-     * Permission denied.
-     */
-    if (finalStatus !== 'granted') {
-      console.warn(
-        '[Push Notifications] Permission not granted.'
-      );
-
-      return null;
-    }
-
-    /**
-     * Android notification channel.
-     */
-    if (Platform.OS === 'android') {
-      await Notifications.setNotificationChannelAsync(
-        'default',
-        {
-          name: 'default',
-          importance:
-            Notifications.AndroidImportance.MAX,
-          vibrationPattern: [
-            0,
-            250,
-            250,
-            250,
-          ],
-        }
-      );
-    }
-
-    /**
-     * Get EAS project ID.
-     */
-    const projectId =
-      Constants.expoConfig?.extra?.eas?.projectId ??
-      Constants.easConfig?.projectId;
-
-    if (!projectId) {
-      console.warn(
-        '[Push Notifications] Expo EAS projectId was not found.'
-      );
-
-      return null;
-    }
-
-    console.log(
-      '[Push Notifications] Project ID:',
-      projectId
-    );
-
-    /**
-     * Get CURRENT device Expo Push Token.
-     */
-    const tokenResponse =
-      await Notifications.getExpoPushTokenAsync({
-        projectId,
-      });
-
-    const pushToken = tokenResponse.data;
-
-    if (!pushToken) {
-      console.warn(
-        '[Push Notifications] No Expo Push Token received.'
-      );
-
-      return null;
-    }
-
-    console.log(
-      '[Push Notifications] Current Expo Push Token:',
-      pushToken
-    );
-
-    /**
-     * Update backend with the current device token.
-     *
-     * IMPORTANT:
-     *
-     * This is deliberately separated from login.
-     * Push registration failure must NEVER cause
-     * login failure.
-     */
-    if (
-      userId !== undefined &&
-      userId !== null
-    ) {
-      try {
-        /**
-         * Dynamic import prevents circular dependency
-         * problems with authStore / axios.
-         */
-        const {
-          registerPushToken,
-        } = await import('@/api/axios');
-
-        await registerPushToken({
-          userId,
-          pushToken,
-          platform: Platform.OS,
-        });
-
-        console.log(
-          '[Push Notifications] Backend token update successful.',
-          {
-            userId,
-            platform: Platform.OS,
-          }
-        );
-      } catch (error) {
-        console.warn(
-          '[Push Notifications] Backend token update failed:',
-          error
-        );
-      }
-    } else {
-      console.warn(
-        '[Push Notifications] userId was not provided.'
-      );
-    }
-
-    return pushToken;
+    return await Notifications.getLastNotificationResponseAsync();
   } catch (error) {
-    /**
-     * Never allow notification problems to
-     * break authentication.
-     */
     console.warn(
-      '[Push Notifications] Registration failed:',
+      '[Push Notifications] Unable to read the launch notification response:',
       error
     );
-
     return null;
+  }
+}
+
+export async function clearLastNotificationResponseAsync() {
+  const Notifications = await getNotificationsModule();
+  if (!Notifications) {
+    return;
+  }
+
+  try {
+    await Notifications.clearLastNotificationResponseAsync();
+  } catch (error) {
+    console.warn(
+      '[Push Notifications] Unable to clear the launch notification response:',
+      error
+    );
   }
 }
 
@@ -426,5 +519,5 @@ export function setupNotificationListeners(
  * authentication credentials.
  */
 export function resetPushRegistrationGuard() {
-  // No push-token authentication state is stored here.
+  registeredPushTokenKeys.clear();
 }

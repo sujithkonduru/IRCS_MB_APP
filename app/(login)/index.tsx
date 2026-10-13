@@ -1,4 +1,8 @@
-import React, { useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useState,
+} from 'react';
 import {
   View,
   Text,
@@ -9,13 +13,20 @@ import {
   KeyboardAvoidingView,
   Platform,
   ScrollView,
+  AppState,
+  Linking,
 } from 'react-native';
 import { Link, useRouter } from 'expo-router';
 import Toast from 'react-native-toast-message';
 import { getApiErrorMessage, api } from '@/api/axios';
 import { Ionicons } from '@expo/vector-icons';
+import * as Location from 'expo-location';
 import { useAuthStore } from '@/store/authStore';
-import { registerForPushNotificationsAsync } from '@/lib/notifications';
+import {
+  getNotificationPermissionStatusAsync,
+  registerForPushNotificationsAsync,
+  requestNotificationPermissionAsync,
+} from '@/lib/notifications';
 import OTPModal from '@/components/OTPModal';
 import { Image } from 'expo-image';
 import logo from '@/assets/images/logo.png';
@@ -28,6 +39,11 @@ export default function LoginScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [showOtpModal, setShowOtpModal] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [permissionConsent, setPermissionConsent] = useState(false);
+  const [locationPermissionStatus, setLocationPermissionStatus] = useState<string | null>(null);
+  const [notificationPermissionStatus, setNotificationPermissionStatus] = useState<string | null>(null);
+  const [permissionFlowInProgress, setPermissionFlowInProgress] = useState(false);
+  const permissionFlowLock = React.useRef(false);
 
   const {
     setAuthSuccess,
@@ -35,11 +51,158 @@ export default function LoginScreen() {
     pendingEmail,
   } = useAuthStore();
 
+  const syncPermissionStatuses = useCallback(async () => {
+    try {
+      const locationPermission =
+        await Location.getForegroundPermissionsAsync();
+      setLocationPermissionStatus(locationPermission.status);
+    } catch {
+      setLocationPermissionStatus('unavailable');
+    }
+
+    const notificationPermission =
+      await getNotificationPermissionStatusAsync();
+    setNotificationPermissionStatus(notificationPermission.status);
+  }, []);
+
+  const requestLocationPermission = useCallback(async () => {
+    try {
+      const { status, canAskAgain } =
+        await Location.getForegroundPermissionsAsync();
+
+      if (status === 'granted') {
+        setLocationPermissionStatus(status);
+        return status;
+      }
+
+      if (status === 'denied' && !canAskAgain) {
+        setLocationPermissionStatus(status);
+        Toast.show({
+          type: 'info',
+          text1: 'Location Access Needed',
+          text2: 'Please enable location permission in device settings for attendance tracking.',
+        });
+        return status;
+      }
+
+      const result = await Location.requestForegroundPermissionsAsync();
+      setLocationPermissionStatus(result.status);
+
+      if (result.status !== 'granted') {
+        Toast.show({
+          type: 'info',
+          text1: 'Location Permission Denied',
+          text2: 'Attendance location checks may be unavailable until you enable it in Settings.',
+        });
+      }
+
+      return result.status;
+    } catch {
+      setLocationPermissionStatus('unavailable');
+      return 'unavailable';
+    }
+  }, []);
+
+  const requestNotificationPermission = useCallback(async () => {
+    const result = await requestNotificationPermissionAsync();
+    setNotificationPermissionStatus(result.status);
+
+    if (result.status === 'denied' && !result.canAskAgain) {
+      Toast.show({
+        type: 'info',
+        text1: 'Notifications Disabled',
+        text2: 'Enable notifications in Settings to receive attendance alerts.',
+      });
+    } else if (result.status === 'denied') {
+      Toast.show({
+        type: 'info',
+        text1: 'Notification Permission Denied',
+        text2: 'You can enable notifications later from the device settings.',
+      });
+    }
+
+    return result.status;
+  }, []);
+
+  const handlePermissionConsentChange = useCallback(
+    async (nextValue: boolean) => {
+      setPermissionConsent(nextValue);
+
+      if (!nextValue) {
+        return;
+      }
+
+      if (permissionFlowLock.current) {
+        return;
+      }
+
+      permissionFlowLock.current = true;
+      setPermissionFlowInProgress(true);
+
+      try {
+        await requestLocationPermission();
+        await requestNotificationPermission();
+      } finally {
+        permissionFlowLock.current = false;
+        setPermissionFlowInProgress(false);
+      }
+    },
+    [requestLocationPermission, requestNotificationPermission]
+  );
+
+  useEffect(() => {
+    const initialCheck = setTimeout(() => {
+      void syncPermissionStatuses();
+    }, 0);
+
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') {
+        setTimeout(() => {
+          void syncPermissionStatuses();
+        }, 0);
+      }
+    });
+
+    return () => {
+      clearTimeout(initialCheck);
+      subscription?.remove();
+    };
+  }, [syncPermissionStatuses]);
+
+  const formatPermissionState = (status: string | null) => {
+    switch (status) {
+      case 'granted':
+        return 'Granted';
+      case 'denied':
+        return 'Denied';
+      case 'restricted':
+        return 'Restricted';
+      case 'limited':
+        return 'Limited';
+      case 'undetermined':
+        return 'Not yet requested';
+      case 'unavailable':
+        return 'Unavailable';
+      default:
+        return 'Not checked';
+    }
+  };
+
   const handleLogin = async () => {
     /**
      * Prevent duplicate login requests.
      */
     if (isLoading) {
+      return;
+    }
+
+    if (!permissionConsent) {
+      Toast.show({
+        type: 'error',
+        text1: 'Permission Required',
+        text2: 'Please agree to the required permissions before logging in.',
+      });
+
       return;
     }
 
@@ -98,11 +261,6 @@ export default function LoginScreen() {
         payload
       );
 
-      console.log(
-        '📥 Login response:',
-        response.data
-      );
-
       /**
        * Support the different token names that
        * your backend may return.
@@ -117,11 +275,6 @@ export default function LoginScreen() {
        * Token is required for authenticated requests.
        */
       if (!token) {
-        console.error(
-          '❌ No token in login response:',
-          response.data
-        );
-
         throw new Error(
           'No authentication token returned from server.'
         );
@@ -148,30 +301,7 @@ export default function LoginScreen() {
        * associated with the USER, while the token itself
        * belongs to the CURRENT DEVICE.
        */
-      const loggedInUser =
-        useAuthStore.getState().user;
-
-      console.log(
-        '👤 Logged-in user:',
-        loggedInUser
-      );
-
-      /**
-       * Prefer user_id because your backend's
-       * notification endpoint expects the user ID.
-       *
-       * Fall back to id / employee_id for compatibility
-       * with your existing JWT structure.
-       */
-      const userId =
-        loggedInUser?.user_id ??
-        loggedInUser?.id ??
-        loggedInUser?.employee_id;
-
-      console.log(
-        '👤 User ID for push token:',
-        userId
-      );
+      const userId = response.data?.data?.user_id;
 
       /**
        * IMPORTANT:
@@ -191,22 +321,21 @@ export default function LoginScreen() {
 
         if (pushToken) {
           console.log(
-            '✅ Current device Expo Push Token registered:',
-            pushToken
+            '✅ Current device Expo Push Token registration confirmed.'
           );
         } else {
           console.log(
             'ℹ️ No push token registered on this device.'
           );
         }
-      } catch (pushError) {
+      } catch (registrationError) {
         /**
          * Do NOT show notification failure as a
          * login failure.
          */
         console.warn(
           '⚠️ Push notification registration failed:',
-          pushError
+          getApiErrorMessage(registrationError),
         );
       }
 
@@ -224,25 +353,10 @@ export default function LoginScreen() {
        */
       router.replace('/(employee)/(tabs)');
     } catch (error: any) {
-      console.error(
-        '❌ Login error:',
-        error
-      );
-
       /**
        * Server returned a response.
        */
       if (error?.response) {
-        console.log(
-          '📥 Server error status:',
-          error.response.status
-        );
-
-        console.log(
-          '📥 Server error data:',
-          error.response.data
-        );
-
         const responseMessage = String(
           error.response.data?.message ?? ''
         ).toLowerCase();
@@ -389,14 +503,73 @@ export default function LoginScreen() {
             </TouchableOpacity>
           </View>
 
+          <View style={styles.permissionContainer}>
+            <TouchableOpacity
+              style={styles.checkboxRow}
+              onPress={() =>
+                handlePermissionConsentChange(!permissionConsent)
+              }
+              disabled={permissionFlowInProgress || isLoading}
+              activeOpacity={0.8}
+            >
+              <View
+                style={[
+                  styles.checkbox,
+                  permissionConsent && styles.checkboxChecked,
+                ]}
+              >
+                {permissionConsent && (
+                  <Ionicons
+                    name="checkmark"
+                    size={16}
+                    color="#fff"
+                  />
+                )}
+              </View>
+
+              <Text style={styles.permissionText}>
+                I agree to grant the required Location and Notification permissions for attendance tracking and alerts.
+                {'\n'}
+                <Text style={styles.permissionRequired}>Required to continue</Text>
+              </Text>
+            </TouchableOpacity>
+
+            <View style={styles.permissionStatusBlock}>
+              <Text style={styles.permissionStatusText}>
+                Location: {formatPermissionState(locationPermissionStatus)}
+              </Text>
+              <Text style={styles.permissionStatusText}>
+                Notifications: {formatPermissionState(notificationPermissionStatus)}
+              </Text>
+            </View>
+
+            {(locationPermissionStatus === 'denied' ||
+              notificationPermissionStatus === 'denied') && (
+              <TouchableOpacity
+                style={styles.settingsButton}
+                onPress={() => Linking.openSettings()}
+              >
+                <Text style={styles.settingsButtonText}>
+                  Open device settings
+                </Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
           <TouchableOpacity
             style={[
               styles.primaryBtn,
-              isLoading &&
+              (isLoading ||
+                permissionFlowInProgress ||
+                !permissionConsent) &&
                 styles.disabledBtn,
             ]}
             onPress={handleLogin}
-            disabled={isLoading}
+            disabled={
+              isLoading ||
+              permissionFlowInProgress ||
+              !permissionConsent
+            }
             activeOpacity={0.7}
           >
             {isLoading ? (
@@ -412,14 +585,14 @@ export default function LoginScreen() {
             href="/(login)/register"
             asChild
           >
-            <TouchableOpacity
+            {/* <TouchableOpacity
               style={styles.linkBtn}
               disabled={isLoading}
-            >
+            > 
               <Text style={styles.linkText}>
-                Don't have an account? Register
+                Don&apos;t have an account? Register
               </Text>
-            </TouchableOpacity>
+            </TouchableOpacity> */}
           </Link>
         </View>
       </ScrollView>
@@ -503,6 +676,78 @@ const styles = StyleSheet.create({
 
   eyeIcon: {
     padding: 16,
+  },
+
+  permissionContainer: {
+    backgroundColor: '#ffffff',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    padding: 14,
+    marginBottom: 18,
+  },
+
+  checkboxRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+  },
+
+  checkbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#cbd5e1',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+
+  checkboxChecked: {
+    backgroundColor: '#3b82f6',
+    borderColor: '#3b82f6',
+  },
+
+  permissionText: {
+    flex: 1,
+    color: '#0f172a',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+
+  permissionRequired: {
+    color: '#dc2626',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+
+  permissionStatusBlock: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#e2e8f0',
+    gap: 4,
+  },
+
+  permissionStatusText: {
+    color: '#475569',
+    fontSize: 12,
+  },
+
+  settingsButton: {
+    marginTop: 10,
+    alignSelf: 'flex-start',
+    backgroundColor: '#eff6ff',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+
+  settingsButtonText: {
+    color: '#1d4ed8',
+    fontWeight: '600',
+    fontSize: 12,
   },
 
   primaryBtn: {

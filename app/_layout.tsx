@@ -12,8 +12,10 @@ import {
   useRootNavigationState,
 } from 'expo-router';
 
+import { AppState } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
+import type * as NotificationsTypes from 'expo-notifications';
 
 import * as SplashScreen from 'expo-splash-screen';
 
@@ -29,11 +31,18 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { useAuthStore } from '@/store/authStore';
 
 import {
+  clearLastNotificationResponseAsync,
+  getLastNotificationResponseAsync,
+  publishCampusPresenceAlert,
   registerForPushNotificationsAsync,
+  setupPushTokenChangeListener,
   setupNotificationListeners,
 } from '@/lib/notifications';
 
-import { getApiErrorMessage } from '@/api/axios';
+import {
+  getApiErrorMessage,
+  getPendingCampusPresenceRequests,
+} from '@/api/axios';
 
 /**
  * ----------------------------------------------------
@@ -112,8 +121,76 @@ export default function RootLayout() {
    * --------------------------------------------------
    */
   const segments = useSegments();
+  const activeRouteGroup = segments[0];
   const router = useRouter();
   const navigationState = useRootNavigationState();
+  const handledNotificationResponse = useRef<string | null>(null);
+  const pendingNotificationResponse =
+    useRef<NotificationsTypes.NotificationResponse | null>(null);
+  const authenticatedUserId = user?.user_id;
+
+  const handleNotificationResponse = useCallback(
+    (response: NotificationsTypes.NotificationResponse) => {
+      if (
+        !token ||
+        !navigationState?.key ||
+        activeRouteGroup === '(login)'
+      ) {
+        pendingNotificationResponse.current = response;
+        return;
+      }
+
+      const notification = response.notification;
+      const data = notification.request.content.data;
+      const campusRequestId =
+        data?.requestId ??
+        data?.request_id ??
+        data?.requestID ??
+        data?.id;
+      const notificationType = String(data?.type ?? '')
+        .toLowerCase()
+        .replace(/_/g, '-');
+      const notificationScreen = String(data?.screen ?? '')
+        .toLowerCase()
+        .replace(/_/g, '-');
+      const responseKey =
+        notification.request.identifier ||
+        `${String(data?.screen ?? '')}:${String(campusRequestId ?? '')}`;
+
+      if (handledNotificationResponse.current === responseKey) {
+        return;
+      }
+      handledNotificationResponse.current = responseKey;
+      void clearLastNotificationResponseAsync();
+
+      if (
+        notificationScreen.startsWith('campus-presence') ||
+        notificationType.startsWith('campus-presence') ||
+        campusRequestId !== undefined
+      ) {
+        router.push({
+          pathname: '/(employee)/campus-presence',
+          params: campusRequestId
+            ? { requestId: String(campusRequestId) }
+            : {},
+        });
+        return;
+      }
+
+      if (data?.screen === 'notifications') {
+        router.push('/(employee)/(tabs)/notifications');
+        return;
+      }
+
+      if (data?.screen === 'attendance') {
+        router.push('/(employee)/(tabs)/attendance');
+        return;
+      }
+
+      router.push('/(employee)/(tabs)/notifications');
+    },
+    [activeRouteGroup, navigationState?.key, router, token],
+  );
 
   /**
    * ==================================================
@@ -124,8 +201,8 @@ export default function RootLayout() {
    * application starts.
    */
   useEffect(() => {
-    checkAuth();
-  }, []);
+    void checkAuth();
+  }, [checkAuth]);
 
   /**
    * ==================================================
@@ -151,43 +228,19 @@ export default function RootLayout() {
 
     let cancelled = false;
 
-    const registerPush = async () => {
+    const registerCurrentExpoToken = async () => {
+      if (cancelled || !authenticatedUserId) {
+        return;
+      }
+
       try {
-        console.log(
-          '[Push Notifications] Starting registration...'
-        );
-
         const pushToken =
-          await registerForPushNotificationsAsync();
-
-        /**
-         * Component may have unmounted while the
-         * asynchronous registration was running.
-         */
-        if (cancelled) {
-          return;
-        }
-
-        if (pushToken) {
-          console.log(
-            '[Push Notifications] Registered successfully:',
-            pushToken
+          await registerForPushNotificationsAsync(
+            authenticatedUserId,
+            false,
           );
-
-          /**
-           * ------------------------------------------------
-           * IMPORTANT
-           * ------------------------------------------------
-           *
-           * This is where you can send the Expo Push Token
-           * to your Stackenzo backend.
-           *
-           * Example:
-           *
-           * await saveExpoPushToken(pushToken);
-           *
-           * Do not add Firebase code here.
-           */
+        if (pushToken) {
+          console.log('[Push Notifications] Registered successfully.');
         } else {
           console.warn(
             '[Push Notifications] No push token returned.'
@@ -200,17 +253,79 @@ export default function RootLayout() {
          */
         console.error(
           '[Push Notifications] Registration failed:',
-          error
+          getApiErrorMessage(error),
         );
       }
     };
 
-    registerPush();
+    void registerCurrentExpoToken();
+
+    let removeTokenListener: (() => void) | undefined;
+    let listenerCancelled = false;
+    void setupPushTokenChangeListener(() => {
+      void registerCurrentExpoToken();
+    }).then((cleanup) => {
+      if (listenerCancelled) {
+        cleanup();
+      } else {
+        removeTokenListener = cleanup;
+      }
+    }).catch((error) => {
+      console.warn('[Push Notifications] Token-change listener failed:', error);
+    });
+
+    const appStateSubscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        registerCurrentExpoToken();
+      }
+    });
 
     return () => {
       cancelled = true;
+      listenerCancelled = true;
+      removeTokenListener?.();
+      appStateSubscription.remove();
     };
-  }, [isAppReady, token]);
+  }, [authenticatedUserId, isAppReady, token]);
+
+  /**
+   * Synchronize pending requests after authentication and each time
+   * the app returns to the foreground. Push remains the delivery
+   * mechanism while the app is backgrounded or terminated.
+   */
+  useEffect(() => {
+    if (!isAppReady || !token) {
+      return;
+    }
+
+    let cancelled = false;
+    const synchronizePendingRequests = async () => {
+      try {
+        if (user?.Role?.toLowerCase() !== 'head') {
+          await getPendingCampusPresenceRequests();
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.warn(
+            '[Campus Presence] Pending requests could not be synchronized.',
+            getApiErrorMessage(error),
+          );
+        }
+      }
+    };
+
+    void synchronizePendingRequests();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        void synchronizePendingRequests();
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      subscription.remove();
+    };
+  }, [isAppReady, token, user?.Role]);
 
   /**
    * ==================================================
@@ -247,28 +362,49 @@ export default function RootLayout() {
        * ----------------------------------------------
        */
       (notification) => {
-        console.log(
-          '[Push Notifications] Received while app is open:',
-          notification
-        );
+        const content = notification.request.content;
+        const data = content.data;
+        const screen = String(data?.screen ?? '')
+          .toLowerCase()
+          .replace(/_/g, '-');
+        const type = String(data?.type ?? '')
+          .toLowerCase()
+          .replace(/_/g, '-');
+        const rawRequestId =
+          data?.requestId ??
+          data?.request_id ??
+          data?.requestID ??
+          data?.id;
+        const isCampusPresence =
+          screen.startsWith('campus-presence') ||
+          type.startsWith('campus-presence') ||
+          rawRequestId !== undefined;
 
-        const content =
-          notification.request.content;
+        if (!isCampusPresence) {
+          return;
+        }
 
-        console.log(
-          '[Push Notifications] Title:',
-          content.title
-        );
+        const requestId =
+          rawRequestId === undefined || rawRequestId === null
+            ? null
+            : String(rawRequestId);
+        const alert = {
+          requestId,
+          notificationId: notification.request.identifier,
+          title: content.title || String(data?.title ?? 'Campus presence check'),
+          message:
+            content.body ||
+            String(data?.message ?? data?.body ?? 'Please respond to your campus presence request.'),
+        };
 
-        console.log(
-          '[Push Notifications] Body:',
-          content.body
-        );
-
-        console.log(
-          '[Push Notifications] Data:',
-          content.data
-        );
+        const wasPublished = publishCampusPresenceAlert(alert);
+        if (wasPublished) {
+          Toast.show({
+            type: 'info',
+            text1: alert.title,
+            text2: alert.message,
+          });
+        }
       },
 
       /**
@@ -277,74 +413,50 @@ export default function RootLayout() {
        * ----------------------------------------------
        */
       (response) => {
-        console.log(
-          '[Push Notifications] Notification tapped:',
-          response
-        );
-
-        const data =
-          response.notification.request.content.data;
-
-        console.log(
-          '[Push Notifications] Notification data:',
-          data
-        );
-
-        /**
-         * --------------------------------------------
-         * NOTIFICATION -> NOTIFICATIONS SCREEN
-         * --------------------------------------------
-         *
-         * Backend example:
-         *
-         * {
-         *   "screen": "notifications"
-         * }
-         */
-        if (data?.screen === 'notifications') {
-          router.push(
-            '/(employee)/(tabs)/notifications'
-          );
-
-          return;
-        }
-
-        /**
-         * --------------------------------------------
-         * NOTIFICATION -> ATTENDANCE SCREEN
-         * --------------------------------------------
-         *
-         * Backend example:
-         *
-         * {
-         *   "screen": "attendance"
-         * }
-         */
-        if (data?.screen === 'attendance') {
-          router.push(
-            '/(employee)/(tabs)/attendance'
-          );
-
-          return;
-        }
-
-        /**
-         * --------------------------------------------
-         * DEFAULT
-         * --------------------------------------------
-         */
-        router.push(
-          '/(employee)/(tabs)/notifications'
-        );
+        handleNotificationResponse(response);
       }
     );
+
+    let cancelled = false;
+    if (token) {
+      void getLastNotificationResponseAsync().then((response) => {
+        if (!cancelled && response) {
+          handleNotificationResponse(response);
+        }
+      });
+    }
 
     /**
      * Remove notification listeners when the
      * RootLayout is unmounted.
      */
-    return cleanup;
-  }, [isAppReady, router]);
+    return () => {
+      cancelled = true;
+      cleanup();
+    };
+  }, [handleNotificationResponse, isAppReady, token]);
+
+  useEffect(() => {
+    if (
+      !isAppReady ||
+      !token ||
+      !navigationState?.key ||
+      activeRouteGroup === '(login)'
+    ) {
+      return;
+    }
+    const pendingResponse = pendingNotificationResponse.current;
+    if (pendingResponse) {
+      pendingNotificationResponse.current = null;
+      handleNotificationResponse(pendingResponse);
+    }
+  }, [
+    handleNotificationResponse,
+    isAppReady,
+    navigationState?.key,
+    activeRouteGroup,
+    token,
+  ]);
 
   /**
    * ==================================================

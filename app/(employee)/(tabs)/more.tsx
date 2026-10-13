@@ -15,6 +15,7 @@ type MoreItem = {
 const ITEMS: MoreItem[] = [
   { label: 'Leave', subtitle: 'Apply for and track leave', icon: 'airplane-outline', route: '/leave' },
   { label: 'Permission', subtitle: 'Request time within your shift', icon: 'exit-outline', route: '/permissions' },
+  { label: 'Campus Presence', subtitle: 'Respond to pending campus checks', icon: 'location-outline', route: '/(employee)/campus-presence' },
   { label: 'Alerts', subtitle: 'Notifications and updates', icon: 'notifications-outline', route: '/notifications' },
   { label: 'Profile', subtitle: 'Your account and settings', icon: 'person-outline', route: '/profile' },
 ];

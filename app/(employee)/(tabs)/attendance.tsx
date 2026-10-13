@@ -306,14 +306,28 @@ function HistoryView() {
 
   const periodMetrics = useMemo(() => {
     const workoffRows = rows.filter((row) => classifyWorkoff(row).isWorkoff);
+    const workoffByDay = new Map<string, boolean>();
+    workoffRows.forEach((row, index) => {
+      const classification = classifyWorkoff(row);
+      const date = row.attendance_date || row.date || row.Attendance_Date;
+      const rowId = row._id || row.id;
+      const identity = date
+        ? `date:${date.substring(0, 10)}`
+        : rowId
+        ? `id:${rowId}`
+        : `row:${index}`;
+      workoffByDay.set(
+        identity,
+        workoffByDay.get(identity) ||
+          classification.status === 'Half-day Work-off',
+      );
+    });
     return {
       recordedDays: attendanceReport?.total_days ?? rows.length,
       totalHours: attendanceReport?.total_hours ?? null,
       averageHours: attendanceReport?.avg_per_day ?? null,
-      workoffDays: workoffRows.length,
-      halfDayWorkoffDays: workoffRows.filter(
-        (row) => classifyWorkoff(row).status === 'Half-day Work-off',
-      ).length,
+      workoffDays: workoffByDay.size,
+      halfDayWorkoffDays: Array.from(workoffByDay.values()).filter(Boolean).length,
     };
   }, [attendanceReport, rows]);
 
@@ -545,17 +559,15 @@ function PeriodMetrics({
           <Text style={styles.periodMetricLabel}>{item.label}</Text>
         </View>
       ))}
-      {metrics.workoffDays > 0 && (
-        <View style={styles.periodMetricItem}>
-          <Ionicons name="sunny-outline" size={15} color="#d97706" />
-          <Text style={[styles.periodMetricValue, styles.workoffMetricValue]}>
-            {metrics.workoffDays}
-          </Text>
-          <Text style={styles.periodMetricLabel}>
-            Work-off{metrics.halfDayWorkoffDays > 0 ? ` (${metrics.halfDayWorkoffDays} half)` : ''}
-          </Text>
-        </View>
-      )}
+      <View style={styles.periodMetricItem}>
+        <Ionicons name="sunny-outline" size={15} color="#d97706" />
+        <Text style={[styles.periodMetricValue, styles.workoffMetricValue]}>
+          {metrics.workoffDays}
+        </Text>
+        <Text style={styles.periodMetricLabel}>
+          Work-off taken{metrics.halfDayWorkoffDays > 0 ? ` (${metrics.halfDayWorkoffDays} half)` : ''}
+        </Text>
+      </View>
     </View>
   );
 }
@@ -906,9 +918,6 @@ function SummaryView() {
     { label: 'Late', value: String(data?.late ?? 0), icon: 'time-outline' },
     { label: 'Early Going', value: String(data?.earlyGoing ?? 0), icon: 'exit-outline' },
     { label: 'Total Hours', value: totalHours, icon: 'hourglass-outline' },
-    ...(data?.workoff !== undefined
-      ? [{ label: 'Work-off', value: String(data.workoff), icon: 'sunny-outline' }]
-      : []),
     ...(remainingLeave !== null
       ? [{ label: 'Remaining leave', value: `${remainingLeave}`, icon: 'leaf-outline' }]
       : []),
@@ -919,6 +928,21 @@ function SummaryView() {
       showsVerticalScrollIndicator={false}
       refreshControl={<RefreshControl refreshing={!!isRefetching} onRefresh={refetch} />}
     >
+      <View style={styles.workoffSummaryCard}>
+        <View style={styles.workoffSummaryHeader}>
+          <Ionicons name="sunny-outline" size={20} color="#d97706" />
+          <Text style={styles.workoffSummaryTitle}>Work-Off Summary</Text>
+        </View>
+        <Text style={styles.workoffSummaryCount}>
+          {data?.workoff === undefined
+            ? 'Work-off attendance count unavailable'
+            : `${data.workoff} day${data.workoff === 1 ? '' : 's'} recorded this month`}
+        </Text>
+        <Text style={styles.workoffSummaryNote}>
+          Count reflects Work-Off attendance records returned for the current month. No allowance or balance is provided by the available API.
+        </Text>
+      </View>
+
       <View style={styles.summaryGrid}>
         {items.map((item) => (
           <View key={item.label} style={styles.summaryCard}>
@@ -1006,6 +1030,41 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     paddingVertical: 10,
     marginBottom: 12,
+  },
+
+  workoffSummaryCard: {
+    backgroundColor: '#fffbeb',
+    borderWidth: 1,
+    borderColor: '#fde68a',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 12,
+  },
+
+  workoffSummaryHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+
+  workoffSummaryTitle: {
+    color: '#92400e',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+
+  workoffSummaryCount: {
+    color: '#78350f',
+    fontSize: 17,
+    fontWeight: '800',
+    marginTop: 10,
+  },
+
+  workoffSummaryNote: {
+    color: '#92400e',
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 5,
   },
 
   periodMetricItem: {

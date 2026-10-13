@@ -50,6 +50,10 @@ api.interceptors.response.use(
   (error: AxiosError) => {
     if (error.response) {
       const responseData = error.response.data as any;
+      const isSensitiveEndpoint =
+        /userLogin|notifications\/register-token|expoToken/i.test(
+          error.config?.url ?? '',
+        );
       const isAttendancePolicyRejection =
         error.response.status === 403 &&
         String(responseData?.status ?? '').trim().toUpperCase() === 'GPS_WINDOW_CLOSED';
@@ -57,9 +61,28 @@ api.interceptors.response.use(
         error.response.status === 400 &&
         String(responseData?.status ?? '').trim().toUpperCase() ===
           'EARLY_GOING_REASON_REQUIRED';
+      const isAttendanceReasonRequired =
+        error.response.status === 400 &&
+        String(responseData?.status ?? '')
+          .trim()
+          .toUpperCase()
+          .endsWith('_REASON_REQUIRED');
 
-      if (isAttendancePolicyRejection || isEarlyGoingReasonRequired) {
-        console.warn('⚠️ Attendance policy response:', responseData);
+      if (isSensitiveEndpoint) {
+        console.error(
+          '❌ API Error:',
+          error.response.status,
+          error.config?.url,
+        );
+      } else if (
+        isAttendancePolicyRejection ||
+        isEarlyGoingReasonRequired ||
+        isAttendanceReasonRequired
+      ) {
+        console.warn(
+          '⚠️ Attendance policy response:',
+          String(responseData?.status ?? 'UNKNOWN'),
+        );
       } else {
         console.error('❌ API Error:', error.response.status, responseData);
       }
@@ -71,7 +94,11 @@ api.interceptors.response.use(
         }
       }
     } else if (error.request) {
-      console.error('❌ Network Error:', error.request);
+      console.error(
+        '❌ Network Error:',
+        error.config?.method?.toUpperCase(),
+        error.config?.url,
+      );
     } else {
       console.error('❌ Request Error:', error.message);
     }
@@ -216,20 +243,130 @@ export interface LoginResponse {
 
 
 export interface RegisterPushTokenPayload {
-  userId: string | number | undefined;
+  userId: string | number;
   pushToken: string;
-  platform: string;
+  platform?: string;
+}
+
+export interface RegisterPushTokenResponse {
+  success: boolean;
+  message?: string;
 }
 
 export async function registerPushToken(
   payload: RegisterPushTokenPayload
+): Promise<RegisterPushTokenResponse> {
+  if (
+    payload.userId === undefined ||
+    payload.userId === null ||
+    String(payload.userId).trim() === ''
+  ) {
+    throw new Error('An authenticated user ID is required to register a push token.');
+  }
+  if (!/^Expo(?:nent)?PushToken\[[^\]]+\]$/.test(payload.pushToken)) {
+    throw new Error('The push token is not a valid Expo Push Token.');
+  }
+
+  const endpoint = `${HR_PREFIX}/expoToken`;
+  if (__DEV__) {
+    console.info('[Push Token] Registration request started:', endpoint);
+  }
+  const response = await updateExpoToken(
+    String(payload.userId),
+    payload.pushToken,
+  );
+  const data = response.data as Partial<RegisterPushTokenResponse> | null;
+
+  if (data?.success !== true) {
+    throw new Error(
+      typeof data?.message === 'string' && data.message.trim()
+        ? data.message
+        : 'The server did not confirm that the Expo Push Token was stored.',
+    );
+  }
+
+  if (__DEV__) {
+    console.info('[Push Token] Backend confirmed token storage.');
+  }
+  return data as RegisterPushTokenResponse;
+}
+
+export interface CampusPresenceRequest {
+  id?: string | number;
+  requestId?: string | number;
+  request_id?: string | number;
+  title?: string | null;
+  message?: string | null;
+  status?: string | null;
+  response?: string | null;
+  createdAt?: string | null;
+  expiresAt?: string | null;
+  expires_at?: string | null;
+  [key: string]: unknown;
+}
+
+export interface CampusPresenceAcceptance {
+  action: 'ACCEPT';
+  latitude: number;
+  longitude: number;
+  accuracy: number | null;
+}
+
+export async function getPendingCampusPresenceRequests(): Promise<CampusPresenceRequest[]> {
+  const response = await api.get('/api/campus-presence/requests/pending');
+  const result = unwrap<any>(response.data);
+  const requests = Array.isArray(result)
+    ? result
+    : Array.isArray(result?.requests)
+    ? result.requests
+    : null;
+
+  if (!requests) {
+    throw new Error('The server returned an invalid campus-presence request list.');
+  }
+
+  return requests as CampusPresenceRequest[];
+}
+
+export async function getCampusPresenceRequest(
+  requestId: string,
+): Promise<CampusPresenceRequest> {
+  const response = await api.get(
+    `/api/campus-presence/requests/${encodeURIComponent(requestId)}`,
+  );
+  const result = unwrap<any>(response.data);
+  const request = result?.request ?? result;
+
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    throw new Error('The server returned an invalid campus-presence request.');
+  }
+
+  return request as CampusPresenceRequest;
+}
+
+export async function respondToCampusPresenceRequest(
+  requestId: string,
+  acceptance: CampusPresenceAcceptance,
 ) {
   const response = await api.post(
-    '/notifications/register-token',
-    payload
+    `/api/campus-presence/requests/${encodeURIComponent(requestId)}/respond`,
+    acceptance,
+    {
+      headers: {
+        'Idempotency-Key': `campus-presence:${requestId}`,
+      },
+    },
   );
 
-  return response.data;
+  const result = unwrap<any>(response.data);
+  if (result?.success === false) {
+    throw new Error(
+      typeof result.message === 'string' && result.message.trim()
+        ? result.message
+        : 'The campus-presence response was not accepted.',
+    );
+  }
+  return result;
 }
 
 
@@ -615,7 +752,7 @@ export interface EmployeeStatusStatistics {
     rejected?: number | string;
   };
   lunch?: EmployeeLunchStatistics;   // ← ADD THIS
-  workoff?: WorkoffStatistics;       // (you're already reading this elsewhere, worth typing too)
+  workoff?: Record<string, unknown>;
   absent_days?: number | string;
 }
 
@@ -634,25 +771,6 @@ export interface EmployeeLunchStatistics {
   allowed_minutes?: number | string | null;
   late?: boolean;
   late_minutes?: number | string | null;
-}
-
-export interface EmployeeStatusStatistics {
-  leaves?: EmployeeLeaveStatistics;
-  permissions?: {
-    total_applied?: number | string;
-    pending?: number | string;
-    approved?: number | string;
-    rejected?: number | string;
-  };
-  late_arrivals?: {
-    total?: number | string;
-    pending?: number | string;
-    approved?: number | string;
-    rejected?: number | string;
-  };
-  lunch?: EmployeeLunchStatistics;   // ← ADD THIS
-  workoff?: WorkoffStatistics;       // (you're already reading this elsewhere, worth typing too)
-  absent_days?: number | string;
 }
 
 export interface WorkoffFields {
@@ -878,26 +996,63 @@ export async function getDashboard(): Promise<DashboardData> {
   const profile = profileResult.status === 'fulfilled' ? profileResult.value : null;
   const pending = pendingResult.status === 'fulfilled' ? pendingResult.value : null;
 
-  // ✅ FIXED: GET /api/hr/get_emp_status nests today's attendance row under
-  // `attendance` (e.g. status.attendance.in_time), NOT under `data` or at
-  // the root. We check `attendance` first and keep the old paths only as
-  // a fallback in case the backend response shape changes again.
-  const check = status?.attendance ?? status?.data ?? null;
+  // GET /api/hr/get_emp_status may return today's attendance under
+  // `attendance`, under `data`, or directly on the response.
+  const check =
+    status?.attendance ??
+    status?.data?.attendance ??
+    status?.data ??
+    status ??
+    null;
 
   if (__DEV__) {
     console.log('📥 getDashboard: Status Response:', {
       success: status?.success,
       message: status?.message,
-      inTime: check?.in_time,
-      outTime: check?.out_time,
+      inTime:
+        check?.in_time ??
+        check?.In_Time ??
+        check?.In_time ??
+        check?.inTime ??
+        status?.in_time ??
+        status?.In_Time ??
+        status?.In_time ??
+        status?.inTime,
+      outTime:
+        check?.out_time ??
+        check?.Out_time ??
+        check?.Out_Time ??
+        check?.outTime ??
+        status?.out_time ??
+        status?.Out_time ??
+        status?.Out_Time ??
+        status?.outTime,
     });
   }
 
   return {
     todayStatus: status?.message,
     statusCode: status?.status,
-    inTime: check?.in_time ?? check?.In_Time ?? check?.inTime ?? null,
-    outTime: check?.out_time ?? check?.Out_time ?? check?.outTime ?? null,
+    inTime:
+      check?.in_time ??
+      check?.In_Time ??
+      check?.In_time ??
+      check?.inTime ??
+      status?.in_time ??
+      status?.In_Time ??
+      status?.In_time ??
+      status?.inTime ??
+      null,
+    outTime:
+      check?.out_time ??
+      check?.Out_time ??
+      check?.Out_Time ??
+      check?.outTime ??
+      status?.out_time ??
+      status?.Out_time ??
+      status?.Out_Time ??
+      status?.outTime ??
+      null,
     hoursWorked: check?.total_hours_worked ?? check?.total_hours ?? '0h 0m',
     shift: profile?.shift?.name ?? undefined,
     shiftStart: profile?.shift?.start_time ?? null,
@@ -1553,10 +1708,25 @@ export async function getAttendanceSummary(): Promise<AttendanceSummary> {
     const data = await getAttendanceRaw(String(employeeId), 'month');
     const rows = data?.attendance || [];
     const present = rows.filter((row) => row.In_Time ?? row.in_time ?? row.inTime).length;
-    const workoffRows = rows.filter((row) => classifyWorkoff(row).isWorkoff);
-    const halfDayWorkoffRows = workoffRows.filter(
-      (row) => classifyWorkoff(row).status === 'Half-day Work-off',
-    );
+    const workoffByDay = new Map<string, boolean>();
+    rows.forEach((row, index) => {
+      const classification = classifyWorkoff(row);
+      if (!classification.isWorkoff) return;
+
+      const date = row.attendance_date ?? row.date;
+      const rowId = row._id ?? row.id;
+      const identity = date
+        ? `date:${date.slice(0, 10)}`
+        : rowId
+        ? `id:${rowId}`
+        : `row:${index}`;
+      workoffByDay.set(
+        identity,
+        workoffByDay.get(identity) ||
+          classification.status === 'Half-day Work-off',
+      );
+    });
+    const halfDayWorkoffDays = Array.from(workoffByDay.values()).filter(Boolean).length;
 
     return {
       totalWorkingDays: data?.total_days ?? rows.length,
@@ -1564,8 +1734,8 @@ export async function getAttendanceSummary(): Promise<AttendanceSummary> {
       absent: Math.max((data?.total_days ?? rows.length) - present, 0),
       late: rows.filter((row) => isTruthyFlag(row.in_time_late) || Boolean(row.delay_in_reason)).length,
       earlyGoing: rows.filter((row) => isTruthyFlag(row.early_going) || Boolean(row.early_going_reason)).length,
-      workoff: workoffRows.length,
-      halfDayWorkoff: halfDayWorkoffRows.length,
+      workoff: workoffByDay.size,
+      halfDayWorkoff: halfDayWorkoffDays,
       totalHours: data?.total_hours ?? '0h 0m',
       avgPerDay: data?.avg_per_day ?? '0h 0m',
     };
@@ -2147,12 +2317,7 @@ export async function getOutsideApprovalStatus(userId: string) {
 export async function updateExpoToken(
   userId: string,
   expoToken: string
-) {
-  console.log("📤 Sending Expo token to backend:", {
-    userId,
-    expoToken,
-  });
-
+): Promise<{ data: unknown; status: number }> {
   const response = await api.put(
     `${HR_PREFIX}/expoToken`,
     {
@@ -2161,9 +2326,13 @@ export async function updateExpoToken(
     }
   );
 
-  console.log("📥 Expo token backend response:", response.data);
+  if (__DEV__) {
+    console.info('[Push Token] Registration API response:', {
+      httpStatus: response.status,
+    });
+  }
 
-  return response.data;
+  return { data: response.data, status: response.status };
 }
 
 function getAttendanceEmployeeCode(): string {

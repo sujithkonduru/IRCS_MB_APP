@@ -10,6 +10,7 @@ import {
   Animated,
   Dimensions,
   Image,
+  KeyboardAvoidingView,
   Platform,
   RefreshControl,
   ScrollView,
@@ -30,12 +31,14 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 
 import { useAuthStore } from '@/store/authStore';
+import AttendanceReasonDialog from '@/components/AttendanceReasonDialog';
 
 import {
   useDashboard,
   useTodayAttendance,
   useManualCheckIn,
   useManualCheckOut,
+  useSendEarlyGoingRequest,
   useProfile,
   useMyAttendanceRequests,
 } from '@/hooks/useEmployeeApi';
@@ -500,6 +503,64 @@ const calculateLunchDuration = (
    ERROR HELPERS
 ============================================================ */
 
+const getCheckInReasonRequirement = (
+  error: unknown,
+): {
+  status: string;
+  title: string;
+  message: string;
+  placeholder: string;
+} | null => {
+  const responseData = (error as any)?.response?.data;
+  const status = String(responseData?.status ?? '').trim().toUpperCase();
+  if (!status.endsWith('_REASON_REQUIRED')) {
+    return null;
+  }
+
+  const message =
+    typeof responseData?.message === 'string' && responseData.message.trim()
+      ? responseData.message
+      : 'Please provide the required attendance reason.';
+
+  if (status === 'LATE_REASON_REQUIRED') {
+    return {
+      status,
+      title: 'Late Arrival Reason',
+      message,
+      placeholder: 'Enter your reason for arriving late',
+    };
+  }
+
+  if (
+    status === 'OUTSIDE_WORK_REASON_REQUIRED' ||
+    status === 'OUTSIDE_REASON_REQUIRED' ||
+    status === 'IN_TIME_OUTSIDE_REASON_REQUIRED'
+  ) {
+    return {
+      status,
+      title: 'Outside-Work Attendance Reason',
+      message,
+      placeholder: 'Enter your reason for outside-work attendance',
+    };
+  }
+
+  if (status === 'WORKOFF_REASON_REQUIRED') {
+    return {
+      status,
+      title: 'Work-Off Attendance Reason',
+      message,
+      placeholder: 'Enter your reason for work-off attendance',
+    };
+  }
+
+  return {
+    status,
+    title: 'Attendance Reason Required',
+    message,
+    placeholder: 'Enter your attendance reason',
+  };
+};
+
 const getErrorStatus = (
   error: any
 ): string | null => {
@@ -636,6 +697,20 @@ export default function EmployeeDashboard() {
   const [reason, setReason] =
     useState('');
 
+  const [
+    checkInReasonRequirement,
+    setCheckInReasonRequirement,
+  ] = useState<{
+    status: string;
+    title: string;
+    message: string;
+    placeholder: string;
+  } | null>(null);
+
+  const [checkInReason, setCheckInReason] = useState('');
+  const [reasonRequiredForWorkoff, setReasonRequiredForWorkoff] =
+    useState(false);
+
   const [task, setTask] =
     useState('');
 
@@ -756,8 +831,13 @@ export default function EmployeeDashboard() {
   const checkInMutation =
     useManualCheckIn();
 
+  const checkInSubmissionLock = useRef(false);
+
   const checkOutMutation =
     useManualCheckOut();
+
+  const earlyGoingRequestMutation =
+    useSendEarlyGoingRequest();
 
   /* ==========================================================
      ANIMATION
@@ -1811,8 +1891,13 @@ export default function EmployeeDashboard() {
 
   const submitCheckIn =
     async (
-      workoff = false
+      workoff = false,
+      suppliedReason?: string,
     ) => {
+      if (checkInSubmissionLock.current || checkInMutation.isPending) {
+        return;
+      }
+
       if (!location) {
         Toast.show({
           type: 'error',
@@ -1820,18 +1905,6 @@ export default function EmployeeDashboard() {
             'Location Required',
           text2:
             'Please enable location and try again.',
-        });
-
-        return;
-      }
-
-      if (!reason.trim()) {
-        Toast.show({
-          type: 'error',
-          text1:
-            'Reason Required',
-          text2:
-            'Please provide a reason for check-in.',
         });
 
         return;
@@ -1853,16 +1926,24 @@ export default function EmployeeDashboard() {
         time:
           new Date().toISOString(),
 
-        reason:
-          reason.trim(),
+        ...(suppliedReason?.trim()
+          ? { reason: suppliedReason.trim() }
+          : {}),
 
         workoff,
       };
 
+      checkInSubmissionLock.current = true;
       try {
-        await checkInMutation.mutateAsync(
+        const response = await checkInMutation.mutateAsync(
           payload
         );
+
+        if (response?.success === false) {
+          throw new Error(
+            response.message || 'The attendance request was not accepted.',
+          );
+        }
 
         await Haptics.notificationAsync(
           Haptics.NotificationFeedbackType.Success
@@ -1882,10 +1963,11 @@ export default function EmployeeDashboard() {
               : 'You have been checked in successfully.',
         });
 
-        setReason('');
         setHolidayPrompt(null);
         setGpsWindowClosed(null);
         setShowCheckInModal(false);
+        setCheckInReasonRequirement(null);
+        setCheckInReason('');
 
         await refetch();
         await refetchAttendance();
@@ -1948,6 +2030,30 @@ export default function EmployeeDashboard() {
           return;
         }
 
+        const reasonRequirement =
+          getCheckInReasonRequirement(error);
+        if (reasonRequirement) {
+          if (!suppliedReason) {
+            Toast.show({
+              type: 'error',
+              text1: reasonRequirement.title,
+              text2: reasonRequirement.message,
+            });
+            setReasonRequiredForWorkoff(workoff);
+            setCheckInReasonRequirement(reasonRequirement);
+            setCheckInReason('');
+            return;
+          }
+
+          if (
+            checkInReasonRequirement &&
+            checkInReasonRequirement.status !== reasonRequirement.status
+          ) {
+            setCheckInReasonRequirement(reasonRequirement);
+            return;
+          }
+        }
+
         await Haptics.notificationAsync(
           Haptics.NotificationFeedbackType.Error
         );
@@ -1956,22 +2062,48 @@ export default function EmployeeDashboard() {
           type: 'error',
           text1:
             'Check-In Failed',
-          text2:
-            getApiErrorMessage(
-              error
-            ),
+          text2: error instanceof Error && !('response' in error)
+            ? error.message
+            : getApiErrorMessage(error),
         });
+      } finally {
+        checkInSubmissionLock.current = false;
       }
     };
 
+  const submitRequiredCheckInReason = () => {
+    const trimmedReason = checkInReason.trim();
+    if (!trimmedReason) {
+      Toast.show({
+        type: 'error',
+        text1: 'Reason Required',
+        text2: 'Enter a reason before submitting attendance.',
+      });
+      return;
+    }
+
+    void submitCheckIn(reasonRequiredForWorkoff, trimmedReason);
+  };
+
+  const cancelRequiredCheckInReason = () => {
+    if (checkInSubmissionLock.current || checkInMutation.isPending) {
+      return;
+    }
+    setCheckInReasonRequirement(null);
+    setCheckInReason('');
+  };
+
   const handleCheckIn =
-    () => submitCheckIn(false);
+    () => submitCheckIn(Boolean(holidayPrompt || data?.holiday));
 
   const handleConfirmWorkoff =
     () => submitCheckIn(true);
 
   const closeCheckInModal =
     () => {
+      if (checkInMutation.isPending) {
+        return;
+      }
       setHolidayPrompt(null);
       setGpsWindowClosed(null);
       setShowCheckInModal(false);
@@ -2024,6 +2156,34 @@ export default function EmployeeDashboard() {
       }
 
       try {
+        if (isEarlyGoing && !hasApprovedEarlyGoing) {
+          await earlyGoingRequestMutation.mutateAsync({
+            userId: user?.employee_id || user?.id || '',
+            reason: earlyGoingReason.trim(),
+            task: task.trim(),
+            time: new Date().toISOString(),
+            lat: location.coords.latitude,
+            lng: location.coords.longitude,
+          });
+
+          await Haptics.notificationAsync(
+            Haptics.NotificationFeedbackType.Success
+          );
+
+          Toast.show({
+            type: 'success',
+            text1: 'Early Going Request Submitted',
+            text2: 'You can check out after HR approves your request.',
+          });
+
+          setTask('');
+          setReason('');
+          setEarlyGoingReason('');
+          setShowCheckOutModal(false);
+          await refetchEarlyGoingRequests();
+          return;
+        }
+
         const payload: any = {
           userId:
             user?.employee_id ||
@@ -2087,7 +2247,9 @@ export default function EmployeeDashboard() {
         Toast.show({
           type: 'error',
           text1:
-            'Check-Out Failed',
+            isEarlyGoing && !hasApprovedEarlyGoing
+              ? 'Early Going Request Failed'
+              : 'Check-Out Failed',
           text2:
             getApiErrorMessage(
               error
@@ -3359,9 +3521,7 @@ export default function EmployeeDashboard() {
                       Haptics.ImpactFeedbackStyle.Medium
                     );
 
-                    setHolidayPrompt(
-                      null
-                    );
+                    setHolidayPrompt(data?.holiday ?? null);
 
                     setGpsWindowClosed(
                       null
@@ -3689,7 +3849,9 @@ export default function EmployeeDashboard() {
                     styles.modalTitle
                   }
                 >
-                  Check In
+                  {holidayPrompt || data?.holiday
+                    ? 'Work-Off Day Attendance'
+                    : 'Check-In Confirmation'}
                 </Text>
 
                 <Text
@@ -3697,7 +3859,9 @@ export default function EmployeeDashboard() {
                     styles.modalSubtitle
                   }
                 >
-                  Mark your attendance
+                  {holidayPrompt || data?.holiday
+                    ? 'Today is a work-off day. Are you sure you want to mark your attendance?'
+                    : 'Are you sure you want to check in?'}
                 </Text>
               </View>
 
@@ -3764,45 +3928,6 @@ export default function EmployeeDashboard() {
               </TouchableOpacity>
             </View>
 
-            <View
-              style={
-                styles.workoffInfoBanner
-              }
-            >
-              <Ionicons
-                name="sunny-outline"
-                size={17}
-                color="#d97706"
-              />
-
-              <Text
-                style={
-                  styles.workoffInfoText
-                }
-              >
-                Working on a holiday?
-                Submit your check-in
-                first. You will then be
-                asked to confirm it as
-                work-off attendance.
-              </Text>
-            </View>
-
-            <TextInput
-              style={
-                styles.modalInput
-              }
-              placeholder="Reason for check-in *"
-              placeholderTextColor="#94a3b8"
-              value={reason}
-              onChangeText={
-                setReason
-              }
-              multiline
-              numberOfLines={3}
-              textAlignVertical="top"
-            />
-
             {holidayPrompt && (
               <View
                 style={
@@ -3825,80 +3950,19 @@ export default function EmployeeDashboard() {
                       styles.holidayPromptTitle
                     }
                   >
-                    Today is a holiday
+                    {holidayPrompt.name}
                   </Text>
                 </View>
-
-                <Text
-                  style={
-                    styles.holidayPromptText
-                  }
-                >
-                  {holidayPrompt.name} ·{' '}
-                  {holidayPrompt.date}
-                </Text>
 
                 <Text
                   style={
                     styles.holidayPromptHint
                   }
                 >
-                  Attendance can be
-                  recorded as work-off only
-                  after you confirm.
+                  {holidayPrompt.date
+                    ? `Work-off date: ${holidayPrompt.date}.`
+                    : 'Attendance will be recorded as work-off only after you confirm.'}
                 </Text>
-
-                <View
-                  style={
-                    styles.holidayPromptActions
-                  }
-                >
-                  <TouchableOpacity
-                    style={
-                      styles.holidayCancelButton
-                    }
-                    onPress={() =>
-                      setHolidayPrompt(
-                        null
-                      )
-                    }
-                  >
-                    <Text
-                      style={
-                        styles.holidayCancelText
-                      }
-                    >
-                      Cancel
-                    </Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={
-                      styles.holidayConfirmButton
-                    }
-                    onPress={
-                      handleConfirmWorkoff
-                    }
-                    disabled={
-                      checkInMutation.isPending
-                    }
-                  >
-                    {checkInMutation.isPending ? (
-                      <ActivityIndicator
-                        color="#ffffff"
-                        size="small"
-                      />
-                    ) : (
-                      <Text
-                        style={
-                          styles.holidayConfirmText
-                        }
-                      >
-                        Confirm work-off
-                      </Text>
-                    )}
-                  </TouchableOpacity>
-                </View>
               </View>
             )}
 
@@ -3983,61 +4047,68 @@ export default function EmployeeDashboard() {
               </View>
             )}
 
-            {!holidayPrompt &&
-              !gpsWindowClosed && (
+            {!gpsWindowClosed && (
+              <View style={styles.modalActionsRow}>
+                <TouchableOpacity
+                  style={[
+                    styles.secondaryModalBtn,
+                    checkInMutation.isPending && styles.disabledBtn,
+                  ]}
+                  onPress={closeCheckInModal}
+                  disabled={checkInMutation.isPending}
+                >
+                  <Text style={styles.secondaryModalBtnText}>Cancel</Text>
+                </TouchableOpacity>
+
                 <TouchableOpacity
                   style={[
                     styles.modalSubmitBtn,
-                    (!location ||
-                      !reason.trim() ||
-                      checkInMutation.isPending) &&
-                      styles.disabledBtn,
+                    checkInMutation.isPending && styles.disabledBtn,
                   ]}
                   onPress={
-                    handleCheckIn
+                    holidayPrompt
+                      ? handleConfirmWorkoff
+                      : handleCheckIn
                   }
-                  disabled={
-                    !location ||
-                    !reason.trim() ||
-                    checkInMutation.isPending
-                  }
+                  disabled={checkInMutation.isPending}
                 >
                   <LinearGradient
-                    colors={[
-                      '#3b82f6',
-                      '#2563eb',
-                    ]}
-                    style={
-                      styles.modalSubmitGradient
-                    }
+                    colors={['#3b82f6', '#2563eb']}
+                    style={styles.modalSubmitGradient}
                   >
                     {checkInMutation.isPending ? (
-                      <ActivityIndicator
-                        color="#fff"
-                      />
+                      <ActivityIndicator color="#fff" />
                     ) : (
                       <>
-                        <Ionicons
-                          name="log-in-outline"
-                          size={20}
-                          color="#fff"
-                        />
-
-                        <Text
-                          style={
-                            styles.modalSubmitText
-                          }
-                        >
-                          Check In
+                        <Ionicons name="log-in-outline" size={20} color="#fff" />
+                        <Text style={styles.modalSubmitText}>
+                          {holidayPrompt || data?.holiday
+                            ? 'Yes, Mark Attendance'
+                            : 'Yes, Check In'}
                         </Text>
                       </>
                     )}
                   </LinearGradient>
                 </TouchableOpacity>
-              )}
+              </View>
+            )}
           </Animated.View>
         </BlurView>
       </Modal>
+
+      {checkInReasonRequirement && (
+        <AttendanceReasonDialog
+          visible
+          title={checkInReasonRequirement.title}
+          message={checkInReasonRequirement.message}
+          placeholder={checkInReasonRequirement.placeholder}
+          value={checkInReason}
+          isSubmitting={checkInMutation.isPending}
+          onChangeText={setCheckInReason}
+          onSubmit={submitRequiredCheckInReason}
+          onCancel={cancelRequiredCheckInReason}
+        />
+      )}
 
       {/* ======================================================
           CHECK OUT MODAL
@@ -4062,279 +4133,333 @@ export default function EmployeeDashboard() {
             styles.modalOverlay
           }
         >
-          <Animated.View
-            style={[
-              styles.modalContent,
-              {
-                transform: [
-                  {
-                    scale:
-                      scaleAnim,
-                  },
-                ],
-              },
-            ]}
+          <KeyboardAvoidingView
+            behavior={
+              Platform.OS === 'ios'
+                ? 'padding'
+                : 'height'
+            }
+            style={{
+              flex: 1,
+              justifyContent: 'flex-end',
+            }}
           >
-            <View
-              style={
-                styles.modalHeader
-              }
+            <Animated.View
+              style={[
+                styles.modalContent,
+                {
+                  maxHeight: '90%',
+                  transform: [
+                    {
+                      scale:
+                        scaleAnim,
+                    },
+                  ],
+                },
+              ]}
             >
-              <View>
-                <Text
-                  style={
-                    styles.modalTitle
-                  }
-                >
-                  Check Out
-                </Text>
+              <View
+                style={
+                  styles.modalHeader
+                }
+              >
+                <View>
+                  <Text
+                    style={
+                      styles.modalTitle
+                    }
+                  >
+                    Check Out
+                  </Text>
 
-                <Text
+                  <Text
+                    style={
+                      styles.modalSubtitle
+                    }
+                  >
+                    Complete your attendance
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  onPress={() =>
+                    setShowCheckOutModal(
+                      false
+                    )
+                  }
                   style={
-                    styles.modalSubtitle
+                    styles.modalCloseBtn
                   }
                 >
-                  Complete your attendance
-                </Text>
+                  <Ionicons
+                    name="close"
+                    size={24}
+                    color="#64748b"
+                  />
+                </TouchableOpacity>
               </View>
 
-              <TouchableOpacity
-                onPress={() =>
-                  setShowCheckOutModal(
-                    false
-                  )
-                }
-                style={
-                  styles.modalCloseBtn
-                }
+              <ScrollView
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+                style={{
+                  flexShrink: 1,
+                }}
+                contentContainerStyle={{
+                  paddingBottom: 12,
+                }}
               >
-                <Ionicons
-                  name="close"
-                  size={24}
-                  color="#64748b"
-                />
-              </TouchableOpacity>
-            </View>
-
-            <View
-              style={
-                styles.locationStatus
-              }
-            >
-              <Ionicons
-                name={
-                  location
-                    ? 'location'
-                    : 'location-outline'
-                }
-                size={20}
-                color={
-                  location
-                    ? '#10b981'
-                    : '#ef4444'
-                }
-              />
-
-              <Text
-                style={
-                  styles.locationStatusText
-                }
-              >
-                {loadingLocation
-                  ? 'Getting location...'
-                  : location
-                  ? 'Location available'
-                  : 'Location not available'}
-              </Text>
-
-              <TouchableOpacity
-                onPress={
-                  getLocation
-                }
-                style={
-                  styles.refreshLocationBtn
-                }
-              >
-                <Ionicons
-                  name="refresh-outline"
-                  size={18}
-                  color="#3b82f6"
-                />
-              </TouchableOpacity>
-            </View>
-
-            <TextInput
-              style={
-                styles.modalInput
-              }
-              placeholder="Today's Task *"
-              placeholderTextColor="#94a3b8"
-              value={task}
-              onChangeText={
-                setTask
-              }
-              multiline
-              numberOfLines={3}
-              textAlignVertical="top"
-            />
-
-            {isEarlyGoing &&
-              hasApprovedEarlyGoing && (
                 <View
                   style={
-                    styles.earlyGoingApprovedBox
+                    styles.locationStatus
                   }
                 >
                   <Ionicons
-                    name="checkmark-circle"
-                    size={18}
-                    color="#059669"
+                    name={
+                      location
+                        ? 'location'
+                        : 'location-outline'
+                    }
+                    size={20}
+                    color={
+                      location
+                        ? '#10b981'
+                        : '#ef4444'
+                    }
                   />
 
                   <Text
                     style={
-                      styles.earlyGoingApprovedText
+                      styles.locationStatusText
                     }
                   >
-                    Early going approved by
-                    HR — you're clear to
-                    check out.
+                    {loadingLocation
+                      ? 'Getting location...'
+                      : location
+                      ? 'Location available'
+                      : 'Location not available'}
                   </Text>
-                </View>
-              )}
 
-            {isEarlyGoing &&
-              !hasApprovedEarlyGoing && (
-                <View
-                  style={
-                    styles.earlyGoingWarningBox
-                  }
-                >
-                  <Ionicons
-                    name="warning-outline"
-                    size={18}
-                    color="#f59e0b"
-                  />
-
-                  <Text
+                  <TouchableOpacity
+                    onPress={
+                      getLocation
+                    }
                     style={
-                      styles.earlyGoingWarningBoxText
+                      styles.refreshLocationBtn
                     }
                   >
-                    You are checking out
-                    before your shift end
-                    time. An HR-approved
-                    Early Going request is
-                    required.
-                  </Text>
+                    <Ionicons
+                      name="refresh-outline"
+                      size={18}
+                      color="#3b82f6"
+                    />
+                  </TouchableOpacity>
                 </View>
-              )}
 
-            {isEarlyGoing &&
-              !hasApprovedEarlyGoing && (
                 <TextInput
-                  style={[
-                    styles.modalInput,
-                    styles.earlyGoingInput,
-                  ]}
-                  placeholder="Early Going Reason *"
-                  placeholderTextColor="#ef4444"
-                  value={
-                    earlyGoingReason
+                  style={
+                    styles.modalInput
                   }
+                  placeholder="Today's Task *"
+                  placeholderTextColor="#94a3b8"
+                  value={task}
                   onChangeText={
-                    setEarlyGoingReason
+                    setTask
                   }
                   multiline
                   numberOfLines={3}
                   textAlignVertical="top"
                 />
-              )}
 
-            <TextInput
-              style={[
-                styles.modalInput,
-                !isEarlyGoing &&
-                  styles.optionalInput,
-              ]}
-              placeholder={
-                isEarlyGoing
-                  ? 'Additional notes (optional)'
-                  : 'Reason (optional)'
-              }
-              placeholderTextColor="#94a3b8"
-              value={reason}
-              onChangeText={
-                setReason
-              }
-              multiline
-              numberOfLines={2}
-              textAlignVertical="top"
-            />
-
-            <TouchableOpacity
-              style={[
-                styles.modalSubmitBtn,
-                (!location ||
-                  !task.trim() ||
-                  checkOutMutation.isPending ||
-                  (isEarlyGoing &&
-                    !hasApprovedEarlyGoing &&
-                    !earlyGoingReason.trim())) &&
-                  styles.disabledBtn,
-              ]}
-              onPress={
-                handleCheckOut
-              }
-              disabled={
-                !location ||
-                !task.trim() ||
-                checkOutMutation.isPending ||
-                (isEarlyGoing &&
-                  !hasApprovedEarlyGoing &&
-                  !earlyGoingReason.trim())
-              }
-            >
-              <LinearGradient
-                colors={[
-                  isEarlyGoing
-                    ? '#f59e0b'
-                    : '#ef4444',
-
-                  isEarlyGoing
-                    ? '#d97706'
-                    : '#dc2626',
-                ]}
-                style={
-                  styles.modalSubmitGradient
-                }
-              >
-                {checkOutMutation.isPending ? (
-                  <ActivityIndicator
-                    color="#fff"
-                  />
-                ) : (
-                  <>
-                    <Ionicons
-                      name="log-out-outline"
-                      size={20}
-                      color="#fff"
-                    />
-
-                    <Text
+                {isEarlyGoing &&
+                  hasApprovedEarlyGoing && (
+                    <View
                       style={
-                        styles.modalSubmitText
+                        styles.earlyGoingApprovedBox
                       }
                     >
-                      {isEarlyGoing
-                        ? 'Check Out (Early Going)'
-                        : 'Check Out'}
-                    </Text>
-                  </>
-                )}
-              </LinearGradient>
-            </TouchableOpacity>
-          </Animated.View>
+                      <Ionicons
+                        name="checkmark-circle"
+                        size={18}
+                        color="#059669"
+                      />
+
+                      <Text
+                        style={
+                          styles.earlyGoingApprovedText
+                        }
+                      >
+                        Early going approved by
+                        HR — you're clear to
+                        check out.
+                      </Text>
+                    </View>
+                  )}
+
+                {isEarlyGoing &&
+                  !hasApprovedEarlyGoing && (
+                    <View
+                      style={
+                        styles.earlyGoingWarningBox
+                      }
+                    >
+                      <Ionicons
+                        name="warning-outline"
+                        size={18}
+                        color="#f59e0b"
+                      />
+
+                      <Text
+                        style={
+                          styles.earlyGoingWarningBoxText
+                        }
+                      >
+                        You are checking out
+                        before your shift end
+                        time. An HR-approved
+                        Early Going request is
+                        required.
+                      </Text>
+                    </View>
+                  )}
+
+                {isEarlyGoing &&
+                  !hasApprovedEarlyGoing && (
+                    <TextInput
+                      style={[
+                        styles.modalInput,
+                        styles.earlyGoingInput,
+                      ]}
+                      placeholder="Early Going Reason *"
+                      placeholderTextColor="#ef4444"
+                      value={
+                        earlyGoingReason
+                      }
+                      onChangeText={
+                        setEarlyGoingReason
+                      }
+                      multiline
+                      numberOfLines={3}
+                      textAlignVertical="top"
+                    />
+                  )}
+
+                <TextInput
+                  style={[
+                    styles.modalInput,
+                    !isEarlyGoing &&
+                      styles.optionalInput,
+                  ]}
+                  placeholder={
+                    isEarlyGoing
+                      ? 'Additional notes (optional)'
+                      : 'Reason (optional)'
+                  }
+                  placeholderTextColor="#94a3b8"
+                  value={
+                    reason
+                  }
+                  onChangeText={
+                    setReason
+                  }
+                  multiline
+                  numberOfLines={2}
+                  textAlignVertical="top"
+                />
+              </ScrollView>
+
+              <View style={styles.modalActionsRow}>
+                <TouchableOpacity
+                  style={styles.secondaryModalBtn}
+                  onPress={() =>
+                    setShowCheckOutModal(false)
+                  }
+                  disabled={
+                    checkOutMutation.isPending ||
+                    earlyGoingRequestMutation.isPending
+                  }
+                >
+                  <Text style={styles.secondaryModalBtnText}>
+                    Cancel
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[
+                    styles.modalSubmitBtn,
+                    (!location ||
+                      !task.trim() ||
+                      checkOutMutation.isPending ||
+                      earlyGoingRequestMutation.isPending ||
+                      (isEarlyGoing &&
+                        !hasApprovedEarlyGoing &&
+                        !earlyGoingReason.trim())) &&
+                      styles.disabledBtn,
+                  ]}
+                  onPress={
+                    handleCheckOut
+                  }
+                  disabled={
+                    !location ||
+                    !task.trim() ||
+                    checkOutMutation.isPending ||
+                    earlyGoingRequestMutation.isPending ||
+                    (isEarlyGoing &&
+                      !hasApprovedEarlyGoing &&
+                      !earlyGoingReason.trim())
+                  }
+                >
+                  <LinearGradient
+                    colors={[
+                      isEarlyGoing
+                        ? '#f59e0b'
+                        : '#ef4444',
+
+                      isEarlyGoing
+                        ? '#d97706'
+                        : '#dc2626',
+                    ]}
+                    style={
+                      styles.modalSubmitGradient
+                    }
+                  >
+                    {checkOutMutation.isPending ||
+                    earlyGoingRequestMutation.isPending ? (
+                      <ActivityIndicator
+                        color="#fff"
+                      />
+                    ) : (
+                      <>
+                        <Ionicons
+                          name={
+                            isEarlyGoing &&
+                            !hasApprovedEarlyGoing
+                              ? 'document-text-outline'
+                              : 'log-out-outline'
+                          }
+                          size={20}
+                          color="#fff"
+                        />
+
+                        <Text
+                          style={
+                            styles.modalSubmitText
+                          }
+                        >
+                          {isEarlyGoing &&
+                          !hasApprovedEarlyGoing
+                            ? 'Request Early Going'
+                            : isEarlyGoing
+                            ? 'Check Out (Early Going)'
+                            : 'Check Out'}
+                        </Text>
+                      </>
+                    )}
+                  </LinearGradient>
+                </TouchableOpacity>
+              </View>
+            </Animated.View>
+          </KeyboardAvoidingView>
         </BlurView>
       </Modal>
 
@@ -5300,26 +5425,6 @@ const styles = StyleSheet.create({
     padding: 4,
   },
 
-  workoffInfoBanner: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    backgroundColor: '#fffbeb',
-    borderWidth: 1,
-    borderColor: '#fde68a',
-    borderRadius: 10,
-    padding: 10,
-    marginBottom: 12,
-    gap: 8,
-  },
-
-  workoffInfoText: {
-    flex: 1,
-    color: '#92400e',
-    fontSize: 12,
-    lineHeight: 17,
-    fontWeight: '600',
-  },
-
   modalInput: {
     backgroundColor: '#f8fafc',
     borderWidth: 1,
@@ -5333,6 +5438,29 @@ const styles = StyleSheet.create({
     minHeight: 48,
   },
 
+  modalActionsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+
+  secondaryModalBtn: {
+    flex: 1,
+    borderRadius: 14,
+    backgroundColor: '#f8fafc',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    minHeight: 54,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  secondaryModalBtnText: {
+    color: '#0f172a',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+
   optionalInput: {
     minHeight: 42,
   },
@@ -5343,6 +5471,7 @@ const styles = StyleSheet.create({
   },
 
   modalSubmitBtn: {
+    flex: 1,
     borderRadius: 14,
     overflow: 'hidden',
     marginTop: 4,
@@ -5389,55 +5518,11 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
 
-  holidayPromptText: {
-    color: '#78350f',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-
   holidayPromptHint: {
     color: '#92400e',
     fontSize: 12,
     marginTop: 5,
     lineHeight: 17,
-  },
-
-  holidayPromptActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 10,
-    marginTop: 14,
-  },
-
-  holidayCancelButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 10,
-    backgroundColor: '#ffffff',
-    borderWidth: 1,
-    borderColor: '#fde68a',
-  },
-
-  holidayCancelText: {
-    color: '#92400e',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-
-  holidayConfirmButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 10,
-    backgroundColor: '#d97706',
-    minWidth: 120,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  holidayConfirmText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '800',
   },
 
   gpsWindowClosed: {

@@ -7,7 +7,7 @@ import Constants from 'expo-constants';
 import { useRouter } from 'expo-router';
 
 import { useAuthStore } from '@/store/authStore';
-import { registerPushToken } from '@/api/axios';
+import { getApiErrorMessage, registerPushToken } from '@/api/axios';
 
 /**
  * Controls how notifications are displayed when the app
@@ -45,6 +45,13 @@ export function usePushNotifications() {
 
     const setupNotifications = async () => {
       try {
+        if (!user.user_id) {
+          console.warn(
+            'Push token registration skipped because authenticated users.id is missing.',
+          );
+          return;
+        }
+
         const token = await registerForPushNotificationsAsync();
 
         if (!mounted) {
@@ -55,22 +62,12 @@ export function usePushNotifications() {
           setExpoPushToken(token);
 
           console.log(
-            'Expo Push Token:',
-            token
+            'Expo Push Token generated.'
           );
 
-          /**
-           * Send the token to your backend.
-           *
-           * Change this payload if your backend expects
-           * different field names.
-           */
           try {
             await registerPushToken({
-              userId:
-                user.employee_id ??
-                user.id ??
-                user.userId,
+              userId: user.user_id,
               pushToken: token,
               platform: Platform.OS,
             });
@@ -78,10 +75,10 @@ export function usePushNotifications() {
             console.log(
               'Push token registered successfully'
             );
-          } catch (error) {
+          } catch (registrationError) {
             console.error(
               'Failed to register push token with backend:',
-              error
+              getApiErrorMessage(registrationError),
             );
           }
         }
@@ -286,4 +283,3 @@ async function registerForPushNotificationsAsync(): Promise<
 
   return token.data;
 }
-

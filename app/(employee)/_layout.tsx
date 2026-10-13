@@ -6,6 +6,7 @@ export default function EmployeeLayout() {
       <Stack.Screen name="(tabs)" />
       <Stack.Screen name="request-details/[id]" options={{ headerShown: true, title: 'Request Details' }} />
       <Stack.Screen name="permission-details/[id]" options={{ headerShown: true, title: 'Permission Pass' }} />
+      <Stack.Screen name="campus-presence" options={{ headerShown: false }} />
     </Stack>
   );
 }
